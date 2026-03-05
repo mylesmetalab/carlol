@@ -23,6 +23,14 @@ canvas{display:block;width:100vw!important;height:100vh!important;image-renderin
 .row select{background:#1a1a1a;color:#ccc;border:1px solid #333;font-size:11px;padding:2px 4px;}
 .val{color:#c84;font-size:11px;width:34px;text-align:right;}
 .row input[type=checkbox]{accent-color:#c84;width:14px;height:14px;cursor:pointer;}
+.row input[type=text]{background:#1a1a1a;color:#ccc;border:1px solid #333;font-size:11px;padding:2px 6px;font-family:monospace;width:100px;}
+.row button{background:#222;color:#ccc;border:1px solid #444;padding:3px 10px;cursor:pointer;font-family:monospace;font-size:11px;}
+.row button:hover{background:#333;}
+.status{padding:3px 16px;color:#888;font-size:10px;font-family:monospace;}
+
+/* ── YouTube in panel ── */
+#ytWrap{padding:6px 16px;}
+#ytWrap iframe{width:100%;height:140px;border:1px solid #333;border-radius:3px;}
 
 /* ── Speed HUD ── */
 #spd{position:fixed;bottom:16px;right:12px;color:#fff;font-size:20px;font-family:monospace;text-shadow:2px 2px 0 #000;pointer-events:none;transition:right .25s;}
@@ -80,12 +88,36 @@ canvas{display:block;width:100vw!important;height:100vh!important;image-renderin
     </select>
   </div>
 
+  <div class="section">🎥 Camera Presets</div>
+  <div class="row"><label>Preset</label>
+    <select id="s_camPreset">
+      <option value="behind" selected>Behind</option>
+      <option value="sideLeft">Side Left</option>
+      <option value="sideRight">Side Right</option>
+      <option value="frontLow">Front Low</option>
+      <option value="topDown">Top Down</option>
+      <option value="cinematic">Cinematic</option>
+    </select>
+  </div>
+  <div class="row"><label>Auto-Cycle</label><input type="checkbox" id="s_autoCycle"></div>
+  <div class="row"><label>Cycle Speed</label><input type="range" id="s_cycleSpeed" min="2" max="15" step="0.5" value="5"><span class="val" id="v_cycleSpeed">5</span></div>
+
+  <div class="section">🎵 Background Video</div>
+  <div class="row"><input type="text" id="ytUrl" style="width:160px" value="https://www.youtube.com/watch?v=zhl-Cs1-sG4"><button id="btnLoadYt" style="margin-left:6px">Load</button></div>
+  <div id="ytWrap"><iframe id="ytFrame" src="" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe></div>
+
+  <div class="section">👥 Multiplayer</div>
+  <div class="status" id="netStatus">Connecting...</div>
+  <div class="row"><label>Players</label><span class="val" id="playerCount" style="width:auto">1</span></div>
+  <div class="row"><label>Your Color</label><input type="color" id="s_mpColor" value="#cc4422"><span class="val" style="color:#888">color</span></div>
+
 </div>
 
 <div id="spd">0 km/h</div>
-<div id="ctrl">WASD / ARROW KEYS to drive &nbsp;|&nbsp; ⚙ SETTINGS top right</div>
+<div id="ctrl">WASD / ARROW KEYS to drive &nbsp;|&nbsp; C = cycle camera &nbsp;|&nbsp; ⚙ SETTINGS top right</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 // ── Settings state ──
 const S = {
@@ -95,8 +127,33 @@ const S = {
   density:6, fog:140, pixel:3, flat:true, clouds:true,
   ground:0x4a7c3f, sky:0x5588cc,
   carcolor:0xcc4422, carscale:1,
-  ambient:0.6, sun:0.9, tod:'day'
+  ambient:0.6, sun:0.9, tod:'day',
+  camPreset:'behind', autoCycle:false, cycleSpeed:5
 };
+
+// ── Camera Presets ──
+const CAM_PRESETS = {
+  behind:    { height:8,  distance:10, lag:0.08, lookAhead:2, angleOffset:0 },
+  sideLeft:  { height:6,  distance:10, lag:0.06, lookAhead:1, angleOffset:Math.PI/2 },
+  sideRight: { height:6,  distance:10, lag:0.06, lookAhead:1, angleOffset:-Math.PI/2 },
+  frontLow:  { height:3,  distance:10, lag:0.06, lookAhead:-2, angleOffset:Math.PI },
+  topDown:   { height:25, distance:0.1, lag:0.12, lookAhead:0, angleOffset:0 },
+  cinematic: { height:5,  distance:14, lag:0.03, lookAhead:3, angleOffset:0 },
+};
+const PRESET_NAMES = Object.keys(CAM_PRESETS);
+let currentPresetIdx = 0;
+let lastCycleTime = 0;
+let cinematicOrbitAngle = 0;
+
+// ── Multiplayer state ──
+let peer = null;
+let connections = [];    // all active DataConnections
+let isHost = false;
+const MP_COLORS = ['#cc4422','#2277cc','#22aa44','#cc8822','#8833aa','#cc2288','#22ccaa','#aaaa22'];
+let myColor = MP_COLORS[Math.floor(Math.random()*MP_COLORS.length)];
+const remotePlayers = new Map(); // peerId -> { mesh, x, z, angle, vel, turnSpeed, color, lastUpdate, tx, tz, tAngle }
+
+function setNetStatus(msg) { document.getElementById('netStatus').textContent = msg; }
 
 // ── Panel wiring ──
 function hexToNum(h){ return parseInt(h.replace('#',''),16); }
@@ -134,6 +191,24 @@ wireRange('s_carscale','carscale');
 wireColor('s_ground','ground'); wireColor('s_sky','sky'); wireColor('s_carcolor','carcolor');
 wireCheck('s_flat','flat'); wireCheck('s_clouds','clouds');
 wireSelect('s_tod','tod');
+wireSelect('s_camPreset','camPreset');
+wireCheck('s_autoCycle','autoCycle');
+wireRange('s_cycleSpeed','cycleSpeed');
+
+document.getElementById('s_camPreset').addEventListener('change',()=>{
+  currentPresetIdx = PRESET_NAMES.indexOf(S.camPreset);
+  lastCycleTime = performance.now();
+});
+
+document.getElementById('s_mpColor').addEventListener('input',(e)=>{
+  myColor = e.target.value;
+  S.carcolor = parseInt(myColor.replace('#',''),16);
+  document.getElementById('s_carcolor').value = myColor;
+  scene.remove(car);
+  car = buildCar(S.carcolor);
+  car.scale.setScalar(S.carscale);
+  scene.add(car);
+});
 
 document.getElementById('panelBtn').addEventListener('click',()=>{
   document.getElementById('panel').classList.toggle('open');
@@ -175,7 +250,7 @@ function box(w,h,d,color,x=0,y=0,z=0){
   m.position.set(x,y,z); return m;
 }
 
-const groundMat = new THREE.MeshLambertMaterial({ color: S.ground });
+const groundMat = new THREE.MeshPhongMaterial({ color: S.ground });
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(4000,4000,1,1), groundMat);
 ground.rotation.x = -Math.PI/2;
 ground.position.y = -0.01;
@@ -297,6 +372,21 @@ let car = buildCar(S.carcolor);
 car.scale.setScalar(S.carscale);
 scene.add(car);
 
+// ── Headlights ──
+const headlightL = new THREE.SpotLight(0xffeedd, 0, 40, Math.PI/5, 0.4, 1.5);
+const headlightR = new THREE.SpotLight(0xffeedd, 0, 40, Math.PI/5, 0.4, 1.5);
+const headlightTarget = new THREE.Object3D();
+scene.add(headlightL, headlightR, headlightTarget);
+headlightL.target = headlightTarget;
+headlightR.target = headlightTarget;
+let headlightsOn = false;
+
+function setHeadlights(on){
+  headlightsOn = on;
+  headlightL.intensity = on ? 2.5 : 0;
+  headlightR.intensity = on ? 2.5 : 0;
+}
+
 // ── Physics objects ──
 const physObjects = [];
 
@@ -388,7 +478,16 @@ buildClouds();
 
 // ── Input ──
 const keys={};
-document.addEventListener('keydown',e=>{keys[e.key]=true; if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();});
+document.addEventListener('keydown',e=>{
+  keys[e.key]=true;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  if(e.key==='c'||e.key==='C'){
+    currentPresetIdx=(currentPresetIdx+1)%PRESET_NAMES.length;
+    S.camPreset=PRESET_NAMES[currentPresetIdx];
+    document.getElementById('s_camPreset').value=S.camPreset;
+    lastCycleTime=performance.now();
+  }
+});
 document.addEventListener('keyup',e=>keys[e.key]=false);
 
 // ── Car state ──
@@ -422,6 +521,7 @@ function onSettingChange(id){
     car=buildCar(S.carcolor);
     car.scale.setScalar(S.carscale);
     scene.add(car);
+    setHeadlights(S.tod === 'night');
   }
   if(id==='s_tod') applyTimeOfDay(S.tod);
 }
@@ -441,6 +541,7 @@ function applyTimeOfDay(tod){
   ambientLight.intensity=t.ambient;
   sunLight.intensity=t.sun;
   sunLight.color.setHex(t.sunColor);
+  setHeadlights(tod === 'night');
   // sync sliders
   document.getElementById('s_sky').value='#'+t.sky.toString(16).padStart(6,'0');
   document.getElementById('s_ambient').value=t.ambient;
@@ -533,6 +634,171 @@ function integrateObjects(dt){
   }
 }
 
+// ── Multiplayer networking ──
+const ROOM_HOST_ID = 'carlol-default-room-host';
+let knownPeers = []; // list of peer IDs in the room (host tracks this)
+
+function updatePlayerCount(){
+  document.getElementById('playerCount').textContent = 1 + remotePlayers.size;
+}
+
+function setupConnection(conn){
+  connections.push(conn);
+  conn.on('open', () => {
+    updatePlayerCount();
+    setNetStatus('Online (' + (1+connections.length) + ' players)');
+    // Host sends peer list to new joiner so they can connect to everyone
+    if(isHost){
+      conn.send({ type:'peerList', peers: connections.map(c=>c.peer).filter(p=>p!==conn.peer) });
+    }
+  });
+  conn.on('data', data => {
+    if(data.type === 'state'){
+      handleRemoteState(conn.peer, data);
+      // Host relays to other peers
+      if(isHost){
+        connections.forEach(c => {
+          if(c.peer !== conn.peer && c.open) c.send(data);
+        });
+      }
+    }
+    if(data.type === 'peerList' && !isHost){
+      // Connect to other peers in mesh (for direct state updates)
+      // Not needed with host relay, but good for robustness
+    }
+    if(data.type === 'leave'){
+      removeRemotePlayer(conn.peer);
+    }
+  });
+  conn.on('close', () => {
+    connections = connections.filter(c => c !== conn);
+    removeRemotePlayer(conn.peer);
+    updatePlayerCount();
+    setNetStatus(connections.length ? 'Online (' + (1+connections.length) + ' players)' : 'Connected (just you)');
+  });
+}
+
+function initMultiplayer(){
+  // Try to become the host by claiming the fixed ID
+  peer = new Peer(ROOM_HOST_ID);
+  peer.on('open', () => {
+    isHost = true;
+    setNetStatus('Online (just you)');
+  });
+  peer.on('error', err => {
+    if(err.type === 'unavailable-id'){
+      // Host already exists — join as a regular peer
+      peer = new Peer();
+      peer.on('open', () => {
+        isHost = false;
+        const conn = peer.connect(ROOM_HOST_ID, { reliable:true });
+        setupConnection(conn);
+        setNetStatus('Connecting to room...');
+      });
+      peer.on('error', err2 => {
+        setNetStatus('Error: ' + err2.type);
+      });
+      peer.on('connection', conn => setupConnection(conn));
+    } else {
+      setNetStatus('Error: ' + err.type);
+    }
+  });
+  peer.on('connection', conn => {
+    setupConnection(conn);
+  });
+}
+
+initMultiplayer();
+
+function handleRemoteState(peerId, data){
+  let rp = remotePlayers.get(peerId);
+  if(!rp){
+    const mesh = buildCar(parseInt(data.color.replace('#',''),16));
+    mesh.scale.setScalar(S.carscale);
+    scene.add(mesh);
+    rp = { mesh, x:data.x, z:data.z, angle:data.angle, vel:0, turnSpeed:0, color:data.color, lastUpdate:performance.now(), tx:data.x, tz:data.z, tAngle:data.angle };
+    remotePlayers.set(peerId, rp);
+    updatePlayerCount();
+  }
+  rp.tx = data.x;
+  rp.tz = data.z;
+  rp.tAngle = data.angle;
+  rp.vel = data.vel;
+  rp.turnSpeed = data.turnSpeed;
+  rp.lastUpdate = performance.now();
+  // Rebuild mesh if color changed
+  if(rp.color !== data.color){
+    scene.remove(rp.mesh);
+    rp.mesh = buildCar(parseInt(data.color.replace('#',''),16));
+    rp.mesh.scale.setScalar(S.carscale);
+    scene.add(rp.mesh);
+    rp.color = data.color;
+  }
+}
+
+function removeRemotePlayer(peerId){
+  const rp = remotePlayers.get(peerId);
+  if(rp){ scene.remove(rp.mesh); remotePlayers.delete(peerId); updatePlayerCount(); }
+}
+
+function updateRemotePlayers(dt){
+  const now = performance.now();
+  for(const [id, rp] of remotePlayers){
+    // Remove stale players
+    if(now - rp.lastUpdate > 10000){ removeRemotePlayer(id); continue; }
+    // Interpolate
+    const t = Math.min(0.15 * dt, 1);
+    rp.x += (rp.tx - rp.x) * t;
+    rp.z += (rp.tz - rp.z) * t;
+    const aDiff = ((rp.tAngle - rp.angle + Math.PI*3) % (Math.PI*2)) - Math.PI;
+    rp.angle += aDiff * t;
+    rp.mesh.position.set(rp.x, 0, rp.z);
+    rp.mesh.rotation.y = rp.angle + Math.PI;
+    rp.mesh.rotation.z = -rp.turnSpeed * (rp.vel / Math.max(S.speed,0.01)) * S.roll;
+  }
+}
+
+let broadcastTimer = 0;
+function broadcastState(dt){
+  broadcastTimer += dt;
+  if(broadcastTimer < 3) return; // ~20 times per second (every 3 frames at 60fps)
+  broadcastTimer = 0;
+  if(connections.length === 0) return;
+  const data = {
+    type:'state',
+    x: car.position.x,
+    z: car.position.z,
+    angle: angle,
+    vel: vel,
+    turnSpeed: turnSpeed,
+    color: myColor
+  };
+  connections.forEach(c => { if(c.open) c.send(data); });
+}
+
+// ── YouTube in panel ──
+function extractYouTubeId(url){
+  const m = url.match(/(?:youtu\.be\/|v=|\/embed\/)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+function loadYouTubeVideo(){
+  const url = document.getElementById('ytUrl').value.trim();
+  const vid = extractYouTubeId(url);
+  if(!vid) return;
+  document.getElementById('ytFrame').src = 'https://www.youtube.com/embed/' + vid + '?autoplay=1&loop=1&playlist=' + vid;
+}
+document.getElementById('btnLoadYt').addEventListener('click', loadYouTubeVideo);
+
+// Set multiplayer color picker to random color
+document.getElementById('s_mpColor').value = myColor;
+// Sync local car to multiplayer color
+S.carcolor = parseInt(myColor.replace('#',''),16);
+document.getElementById('s_carcolor').value = myColor;
+scene.remove(car);
+car = buildCar(S.carcolor);
+car.scale.setScalar(S.carscale);
+scene.add(car);
+
 // ── Loop ──
 let last=0;
 function loop(ts){
@@ -557,23 +823,50 @@ function loop(ts){
 
   car.position.x+=Math.sin(angle)*vel*dt;
   car.position.z+=Math.cos(angle)*vel*dt;
-  car.rotation.y=angle;
+  car.rotation.y=angle+Math.PI;
   car.rotation.z=-turnSpeed*(vel/S.speed)*S.roll;
+
+  // Headlight positions (at front of car, pointing forward)
+  if(headlightsOn){
+    const fwd_x=Math.sin(angle), fwd_z=Math.cos(angle);
+    const cx=car.position.x, cz=car.position.z;
+    headlightL.position.set(cx-fwd_z*0.7+fwd_x*2.5, 1.0, cz+fwd_x*0.7+fwd_z*2.5);
+    headlightR.position.set(cx+fwd_z*0.7+fwd_x*2.5, 1.0, cz-fwd_x*0.7+fwd_z*2.5);
+    headlightTarget.position.set(cx+fwd_x*20, 0, cz+fwd_z*20);
+  }
 
   resolveCarCollisions();
   resolveObjectCollisions();
   integrateObjects(dt);
 
-  // Camera
-  const angleDiff=((angle-camAngle+Math.PI*3)%(Math.PI*2))-Math.PI;
-  camAngle+=angleDiff*S.camLag*dt;
-  const tcx=car.position.x-Math.sin(camAngle)*S.camD;
-  const tcz=car.position.z-Math.cos(camAngle)*S.camD;
+  // Camera auto-cycle
+  if(S.autoCycle && performance.now()-lastCycleTime > S.cycleSpeed*1000){
+    currentPresetIdx=(currentPresetIdx+1)%PRESET_NAMES.length;
+    S.camPreset=PRESET_NAMES[currentPresetIdx];
+    document.getElementById('s_camPreset').value=S.camPreset;
+    lastCycleTime=performance.now();
+  }
+
+  // Camera with presets
+  const preset=CAM_PRESETS[S.camPreset];
+  let camDist=preset.distance, camHeight=preset.height, camLag=preset.lag, camLookAhead=preset.lookAhead;
+  let camAngleOff=preset.angleOffset;
+
+  if(S.camPreset==='cinematic'){
+    cinematicOrbitAngle+=0.008*dt;
+    camAngleOff=cinematicOrbitAngle;
+  }
+
+  const targetCamAngle=angle+camAngleOff;
+  const angleDiff=((targetCamAngle-camAngle+Math.PI*3)%(Math.PI*2))-Math.PI;
+  camAngle+=angleDiff*camLag*dt;
+  const tcx=car.position.x-Math.sin(camAngle)*camDist;
+  const tcz=car.position.z-Math.cos(camAngle)*camDist;
   camera.position.x+=(tcx-camera.position.x)*0.12*dt;
   camera.position.z+=(tcz-camera.position.z)*0.12*dt;
-  camera.position.y+=(S.camH-camera.position.y)*0.1*dt;
-  const lx=car.position.x+Math.sin(angle)*S.lookAhead;
-  const lz=car.position.z+Math.cos(angle)*S.lookAhead;
+  camera.position.y+=(camHeight-camera.position.y)*0.1*dt;
+  const lx=car.position.x+Math.sin(angle)*camLookAhead;
+  const lz=car.position.z+Math.cos(angle)*camLookAhead;
   camera.lookAt(lx,1.2,lz);
 
   cloudMeshes.forEach(c=>{
@@ -583,6 +876,10 @@ function loop(ts){
 
   updateGround();
   updateChunks();
+
+  // Multiplayer
+  updateRemotePlayers(dt);
+  broadcastState(dt);
 
   document.getElementById('spd').textContent=Math.abs(Math.round(vel*380))+' km/h';
   renderer.render(scene,camera);
