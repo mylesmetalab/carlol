@@ -91,6 +91,7 @@ canvas{display:block;width:100vw!important;height:100vh!important;image-renderin
   <div class="section">🎥 Camera Presets</div>
   <div class="row"><label>Preset</label>
     <select id="s_camPreset">
+      <option value="custom">Custom</option>
       <option value="behind" selected>Behind</option>
       <option value="sideLeft">Side Left</option>
       <option value="sideRight">Side Right</option>
@@ -133,6 +134,7 @@ const S = {
 
 // ── Camera Presets ──
 const CAM_PRESETS = {
+  custom:    { height:8,  distance:10, lag:0.08, lookAhead:2, angleOffset:0 },
   behind:    { height:8,  distance:10, lag:0.08, lookAhead:2, angleOffset:0 },
   sideLeft:  { height:6,  distance:10, lag:0.06, lookAhead:1, angleOffset:Math.PI/2 },
   sideRight: { height:6,  distance:10, lag:0.06, lookAhead:1, angleOffset:-Math.PI/2 },
@@ -144,6 +146,33 @@ const PRESET_NAMES = Object.keys(CAM_PRESETS);
 let currentPresetIdx = 0;
 let lastCycleTime = 0;
 let cinematicOrbitAngle = 0;
+
+// ── Random name generator ──
+const NAME_ADJ = ['Speedy','Dusty','Rusty','Lucky','Mad','Tiny','Turbo','Drift','Nitro','Wild','Chill','Mega','Slick','Heavy','Flash','Crazy','Rocky','Sunny','Hazy','Bold'];
+const NAME_NOUN = ['Fox','Wheel','Hawk','Bear','Wolf','Rider','Ace','Bolt','Rex','Dash','Storm','Blaze','Spark','Ghost','Ranger','Viper','Moose','Raven','Comet','Panda'];
+function randomName(){
+  return NAME_ADJ[Math.floor(Math.random()*NAME_ADJ.length)] + NAME_NOUN[Math.floor(Math.random()*NAME_NOUN.length)];
+}
+const myName = randomName();
+
+function makeNameSprite(name, color){
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.font = 'bold 32px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#000';
+  ctx.globalAlpha = 0.4;
+  ctx.fillRect(128 - ctx.measureText(name).width/2 - 8, 8, ctx.measureText(name).width + 16, 44);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = color || '#fff';
+  ctx.fillText(name, 128, 40);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(4, 1, 1);
+  return sprite;
+}
 
 // ── Multiplayer state ──
 let peer = null;
@@ -371,6 +400,9 @@ function buildCloud(){
 let car = buildCar(S.carcolor);
 car.scale.setScalar(S.carscale);
 scene.add(car);
+let myNameSprite = makeNameSprite(myName, '#fff');
+myNameSprite.position.set(0, 3.5, 0);
+scene.add(myNameSprite);
 
 // ── Headlights ──
 const headlightL = new THREE.SpotLight(0xffeedd, 0, 40, Math.PI/5, 0.4, 1.5);
@@ -495,7 +527,13 @@ let vel=0,angle=0,turnSpeed=0,camAngle=0;
 const CAR_HW=1.1,CAR_HD=2.1;
 
 // ── Setting change handler ──
+const CAM_SLIDER_IDS = ['s_camH','s_camD','s_camLag','s_lookAhead'];
 function onSettingChange(id){
+  if(CAM_SLIDER_IDS.includes(id) && S.camPreset !== 'custom'){
+    S.camPreset = 'custom';
+    document.getElementById('s_camPreset').value = 'custom';
+    currentPresetIdx = 0;
+  }
   if(id==='s_pixel'){
     pixelScale=S.pixel;
     setSize();
@@ -583,6 +621,36 @@ function resolveCarCollisions(){
   }
 }
 
+// Host resolves collisions for remote players against physics objects
+function resolveRemoteCarCollisions(){
+  if(!isHost) return;
+  for(const [id, rp] of remotePlayers){
+    const cx=rp.x, cz=rp.z;
+    const spd=Math.abs(rp.tVel)||0.1;
+    for(const obj of physObjects){
+      const p=obj.mesh.parent;
+      const wx=p.position.x+obj.mesh.position.x;
+      const wz=p.position.z+obj.mesh.position.z;
+      const dx=cx-wx,dz=cz-wz;
+      const ovX=CAR_HW+obj.hw-Math.abs(dx);
+      const ovZ=CAR_HD+obj.hd-Math.abs(dz);
+      if(ovX>0&&ovZ>0){
+        const dist=Math.sqrt(dx*dx+dz*dz)||1;
+        const nx=-dx/dist,nz=-dz/dist;
+        const imp=spd*S.impact/obj.mass;
+        const spn=spd*S.spin/obj.mass;
+        obj.vx+=nx*imp*(1+Math.random()*.3);
+        obj.vz+=nz*imp*(1+Math.random()*.3);
+        obj.vy=spd*(0.4+Math.random()*.5)/obj.mass;
+        obj.angVel+=(Math.random()-.5)*spn*3;
+        obj.angX+=(Math.random()-.5)*spn*2;
+        obj.angZ+=(Math.random()-.5)*spn*2;
+        obj.settled=false;
+      }
+    }
+  }
+}
+
 function resolveObjectCollisions(){
   for(let i=0;i<physObjects.length;i++){
     const a=physObjects[i]; if(a.settled) continue;
@@ -647,10 +715,6 @@ function setupConnection(conn){
   conn.on('open', () => {
     updatePlayerCount();
     setNetStatus('Online (' + (1+connections.length) + ' players)');
-    // Host sends peer list to new joiner so they can connect to everyone
-    if(isHost){
-      conn.send({ type:'peerList', peers: connections.map(c=>c.peer).filter(p=>p!==conn.peer) });
-    }
   });
   conn.on('data', data => {
     if(data.type === 'state'){
@@ -662,9 +726,9 @@ function setupConnection(conn){
         });
       }
     }
-    if(data.type === 'peerList' && !isHost){
-      // Connect to other peers in mesh (for direct state updates)
-      // Not needed with host relay, but good for robustness
+    if(data.type === 'physics' && !isHost){
+      // Joiner receives authoritative physics from host
+      applyHostPhysics(data.objects);
     }
     if(data.type === 'leave'){
       removeRemotePlayer(conn.peer);
@@ -691,7 +755,7 @@ function initMultiplayer(){
       peer = new Peer();
       peer.on('open', () => {
         isHost = false;
-        const conn = peer.connect(ROOM_HOST_ID, { reliable:true });
+        const conn = peer.connect(ROOM_HOST_ID, { reliable:false });
         setupConnection(conn);
         setNetStatus('Connecting to room...');
       });
@@ -716,15 +780,29 @@ function handleRemoteState(peerId, data){
     const mesh = buildCar(parseInt(data.color.replace('#',''),16));
     mesh.scale.setScalar(S.carscale);
     scene.add(mesh);
-    rp = { mesh, x:data.x, z:data.z, angle:data.angle, vel:0, turnSpeed:0, color:data.color, lastUpdate:performance.now(), tx:data.x, tz:data.z, tAngle:data.angle };
+    const name = data.name || peerId.slice(0,8);
+    const nameSprite = makeNameSprite(name, data.color);
+    nameSprite.position.set(data.x, 3.5, data.z);
+    scene.add(nameSprite);
+    rp = { mesh, nameSprite, name, x:data.x, z:data.z, angle:data.angle, vel:data.vel||0, turnSpeed:data.turnSpeed||0,
+           color:data.color, lastUpdate:performance.now(),
+           px:data.x, pz:data.z, pAngle:data.angle,
+           tx:data.x, tz:data.z, tAngle:data.angle,
+           tVel:0, tTurn:0, updateTime:performance.now(), prevUpdateTime:performance.now() };
     remotePlayers.set(peerId, rp);
     updatePlayerCount();
+    return;
   }
+  // Shift current target to previous
+  rp.px = rp.tx; rp.pz = rp.tz; rp.pAngle = rp.tAngle;
+  rp.prevUpdateTime = rp.updateTime;
+  // Set new target
   rp.tx = data.x;
   rp.tz = data.z;
   rp.tAngle = data.angle;
-  rp.vel = data.vel;
-  rp.turnSpeed = data.turnSpeed;
+  rp.tVel = data.vel;
+  rp.tTurn = data.turnSpeed;
+  rp.updateTime = performance.now();
   rp.lastUpdate = performance.now();
   // Rebuild mesh if color changed
   if(rp.color !== data.color){
@@ -732,38 +810,95 @@ function handleRemoteState(peerId, data){
     rp.mesh = buildCar(parseInt(data.color.replace('#',''),16));
     rp.mesh.scale.setScalar(S.carscale);
     scene.add(rp.mesh);
+    scene.remove(rp.nameSprite);
+    rp.nameSprite = makeNameSprite(rp.name, data.color);
+    scene.add(rp.nameSprite);
     rp.color = data.color;
   }
 }
 
 function removeRemotePlayer(peerId){
   const rp = remotePlayers.get(peerId);
-  if(rp){ scene.remove(rp.mesh); remotePlayers.delete(peerId); updatePlayerCount(); }
+  if(rp){ scene.remove(rp.mesh); scene.remove(rp.nameSprite); remotePlayers.delete(peerId); updatePlayerCount(); }
 }
 
 function updateRemotePlayers(dt){
   const now = performance.now();
   for(const [id, rp] of remotePlayers){
-    // Remove stale players
     if(now - rp.lastUpdate > 10000){ removeRemotePlayer(id); continue; }
-    // Interpolate
-    const t = Math.min(0.15 * dt, 1);
-    rp.x += (rp.tx - rp.x) * t;
-    rp.z += (rp.tz - rp.z) * t;
-    const aDiff = ((rp.tAngle - rp.angle + Math.PI*3) % (Math.PI*2)) - Math.PI;
-    rp.angle += aDiff * t;
+
+    // Time-based interpolation between prev and current target
+    const updateInterval = Math.max(rp.updateTime - rp.prevUpdateTime, 30);
+    const elapsed = now - rp.updateTime;
+    // t=0 at last update, t=1 when the next update is expected
+    const t = Math.min(elapsed / updateInterval, 1.5);
+
+    // Interpolate position (with slight extrapolation up to 1.5x)
+    rp.x = rp.px + (rp.tx - rp.px) * t;
+    rp.z = rp.pz + (rp.tz - rp.pz) * t;
+
+    // Interpolate angle (shortest path)
+    const aDiff = ((rp.tAngle - rp.pAngle + Math.PI*3) % (Math.PI*2)) - Math.PI;
+    rp.angle = rp.pAngle + aDiff * Math.min(t, 1);
+
     rp.mesh.position.set(rp.x, 0, rp.z);
     rp.mesh.rotation.y = rp.angle + Math.PI;
-    rp.mesh.rotation.z = -rp.turnSpeed * (rp.vel / Math.max(S.speed,0.01)) * S.roll;
+    rp.mesh.rotation.z = -rp.tTurn * (rp.tVel / Math.max(S.speed,0.01)) * S.roll;
+    rp.nameSprite.position.set(rp.x, 3.5, rp.z);
+  }
+}
+
+// Host broadcasts non-settled physics object states to joiners
+let physBroadcastTimer = 0;
+function broadcastPhysics(dt){
+  if(!isHost || connections.length === 0) return;
+  physBroadcastTimer += dt;
+  if(physBroadcastTimer < 6) return; // ~10Hz for physics sync
+  physBroadcastTimer = 0;
+  const active = [];
+  for(const obj of physObjects){
+    if(obj.settled) continue;
+    const p = obj.mesh.parent;
+    active.push({
+      cx: p.position.x, cz: p.position.z,
+      lx: obj.mesh.position.x, lz: obj.mesh.position.z, ly: obj.mesh.position.y,
+      rx: obj.mesh.rotation.x, ry: obj.mesh.rotation.y, rz: obj.mesh.rotation.z,
+      vx: obj.vx, vz: obj.vz, vy: obj.vy
+    });
+  }
+  if(active.length === 0) return;
+  const data = { type:'physics', objects: active };
+  connections.forEach(c => { if(c.open) c.send(data); });
+}
+
+// Joiner applies host's physics state
+function applyHostPhysics(objects){
+  for(const od of objects){
+    // Find the matching physics object by chunk + local position proximity
+    let best = null, bestDist = 5;
+    for(const obj of physObjects){
+      const p = obj.mesh.parent;
+      const dx = (p.position.x + obj.mesh.position.x) - (od.cx + od.lx);
+      const dz = (p.position.z + obj.mesh.position.z) - (od.cz + od.lz);
+      const d = Math.abs(dx) + Math.abs(dz);
+      if(d < bestDist){ bestDist = d; best = obj; }
+    }
+    if(best){
+      best.mesh.position.x = od.lx; best.mesh.position.z = od.lz; best.mesh.position.y = od.ly;
+      best.mesh.rotation.x = od.rx; best.mesh.rotation.y = od.ry; best.mesh.rotation.z = od.rz;
+      best.vx = od.vx; best.vz = od.vz; best.vy = od.vy;
+      best.settled = false;
+    }
   }
 }
 
 let broadcastTimer = 0;
 function broadcastState(dt){
   broadcastTimer += dt;
-  if(broadcastTimer < 3) return; // ~20 times per second (every 3 frames at 60fps)
+  if(broadcastTimer < 2) return; // ~30Hz
   broadcastTimer = 0;
   if(connections.length === 0) return;
+  // Dead zone: don't send if essentially stationary and nothing changed
   const data = {
     type:'state',
     x: car.position.x,
@@ -771,7 +906,8 @@ function broadcastState(dt){
     angle: angle,
     vel: vel,
     turnSpeed: turnSpeed,
-    color: myColor
+    color: myColor,
+    name: myName
   };
   connections.forEach(c => { if(c.open) c.send(data); });
 }
@@ -825,6 +961,7 @@ function loop(ts){
   car.position.z+=Math.cos(angle)*vel*dt;
   car.rotation.y=angle+Math.PI;
   car.rotation.z=-turnSpeed*(vel/S.speed)*S.roll;
+  myNameSprite.position.set(car.position.x, 3.5, car.position.z);
 
   // Headlight positions (at front of car, pointing forward)
   if(headlightsOn){
@@ -836,6 +973,19 @@ function loop(ts){
   }
 
   resolveCarCollisions();
+  resolveRemoteCarCollisions();
+  // Car-to-car collisions (push local car away from remote cars)
+  for(const [id, rp] of remotePlayers){
+    const dx=car.position.x-rp.x, dz=car.position.z-rp.z;
+    const ovX=CAR_HW*2-Math.abs(dx), ovZ=CAR_HD*2-Math.abs(dz);
+    if(ovX>0&&ovZ>0){
+      const dist=Math.sqrt(dx*dx+dz*dz)||1;
+      const push=Math.min(ovX,ovZ)*0.3;
+      car.position.x+=dx/dist*push;
+      car.position.z+=dz/dist*push;
+      vel*=0.85;
+    }
+  }
   resolveObjectCollisions();
   integrateObjects(dt);
 
@@ -848,9 +998,13 @@ function loop(ts){
   }
 
   // Camera with presets
-  const preset=CAM_PRESETS[S.camPreset];
-  let camDist=preset.distance, camHeight=preset.height, camLag=preset.lag, camLookAhead=preset.lookAhead;
-  let camAngleOff=preset.angleOffset;
+  let camDist, camHeight, camLag, camLookAhead, camAngleOff;
+  if(S.camPreset==='custom'){
+    camDist=S.camD; camHeight=S.camH; camLag=S.camLag; camLookAhead=S.lookAhead; camAngleOff=0;
+  } else {
+    const preset=CAM_PRESETS[S.camPreset];
+    camDist=preset.distance; camHeight=preset.height; camLag=preset.lag; camLookAhead=preset.lookAhead; camAngleOff=preset.angleOffset;
+  }
 
   if(S.camPreset==='cinematic'){
     cinematicOrbitAngle+=0.008*dt;
@@ -880,6 +1034,7 @@ function loop(ts){
   // Multiplayer
   updateRemotePlayers(dt);
   broadcastState(dt);
+  broadcastPhysics(dt);
 
   document.getElementById('spd').textContent=Math.abs(Math.round(vel*380))+' km/h';
   renderer.render(scene,camera);
